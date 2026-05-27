@@ -1,562 +1,293 @@
-#!/usr/bin/env python3
-"""
-YouTube Firework Video Data Collector
-======================================
-Collects cake and fountain firework videos from YouTube (2023-2026).
-
-Search: Invidious API (public, no auth required)
-Enrichment: yt-dlp (fallback to Invidious data if blocked)
-
-Usage:
-    pip install -r requirements.txt
-    python collect_data.py
-
-Output:
-    firework_video_data.xlsx
-"""
-
-import os
-import shutil
-import subprocess
-import json
-import sys
-import time
-from datetime import datetime
-from pathlib import Path
-from urllib.request import Request, urlopen
-from urllib.error import URLError
-from urllib.parse import quote
-
-import openpyxl
-from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-from openpyxl.utils import get_column_letter
-
-# ============================================================
-# YT-DLP DISCOVERY (for enrichment only)
-# ============================================================
-
-def _find_ytdlp():
-    found = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
-    if found:
-        return found
-    local_appdata = os.environ.get("LOCALAPPDATA", "")
-    appdata = os.environ.get("APPDATA", "")
-    for py_ver in ["Python312", "Python311", "Python310", "Python39", "Python3"]:
-        for base in [
-            os.path.join(local_appdata, "Programs", "Python", py_ver, "Scripts"),
-            os.path.join(appdata, "Python", py_ver, "Scripts"),
-            os.path.join("C:\\", "Program Files", py_ver, "Scripts"),
-        ]:
-            for name in ["yt-dlp.exe", "yt-dlp"]:
-                p = os.path.join(base, name)
-                if os.path.isfile(p):
-                    return p
-    return "yt-dlp"
-
-YTDLP = _find_ytdlp()
-
-
-# ============================================================
-# SEARCH: Piped API -> DuckDuckGo -> Invidious (multi-fallback)
-# ============================================================
-
-PIPED_INSTANCES = [
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi.tokhmi.xyz",
-    "https://pipedapi.moomoo.me",
-    "https://pipedapi.syncpundit.io",
-    "https://pipedapi.adminforge.de",
-    "https://pipedapi.leptons.xyz",
-]
-
-INVIDIOUS_INSTANCES = [
-    "https://invidious.fdn.fr",
-    "https://vid.puffyan.us",
-    "https://yewtu.be",
-    "https://inv.nadeko.net",
-]
-
-
-def _make_video_dict(video_id, title="", uploader="", duration=0, view_count=0, description=""):
-    return {
-        "id": video_id,
-        "title": title,
-        "description": description,
-        "uploader": uploader,
-        "duration": duration,
-        "view_count": view_count,
-        "upload_date": None,
-        "webpage_url": f"https://www.youtube.com/watch?v={video_id}",
-    }
-
-
-def _piped_search(query, max_results=25):
-    """Search YouTube via Piped API."""
-    encoded = quote(query)
-    for instance in PIPED_INSTANCES:
-        url = f"{instance}/search?q={encoded}&filter=videos"
-        try:
-            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            resp = urlopen(req, timeout=20)
-            data = json.loads(resp.read().decode())
-            results = []
-            for item in data.get("items", [])[:max_results]:
-                vid_url = item.get("url", "")
-                vid = vid_url.replace("/watch?v=", "") if "/watch?v=" in vid_url else ""
-                if not vid:
-                    continue
-                # Piped duration is in seconds, views as integer
-                results.append(_make_video_dict(
-                    video_id=vid,
-                    title=item.get("title", ""),
-                    uploader=item.get("uploaderName", ""),
-                    duration=item.get("duration", 0),
-                    view_count=item.get("views", 0),
-                    description=item.get("shortDescription", ""),
-                ))
-            if results:
-                print(f"      [via {instance.split('//')[1].split('/')[0]}]")
-                return results
-        except (URLError, json.JSONDecodeError, Exception):
-            continue
-    return []
-
-
-def _duckduckgo_search(query, max_results=25):
-    """Search for YouTube videos via DuckDuckGo HTML (no auth needed)."""
-    import re
-    encoded = quote(f"site:youtube.com/watch {query}")
-    url = f"https://html.duckduckgo.com/html/?q={encoded}"
-    try:
-        req = Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        })
-        resp = urlopen(req, timeout=20)
-        html = resp.read().decode("utf-8", errors="replace")
-        # Extract YouTube video IDs from result links
-        ids = re.findall(r'youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})', html)
-        seen = set()
-        results = []
-        for vid in ids:
-            if vid in seen:
-                continue
-            seen.add(vid)
-            results.append(_make_video_dict(video_id=vid))
-            if len(results) >= max_results:
-                break
-        if results:
-            print(f"      [via DuckDuckGo]")
-            return results
-    except (URLError, Exception):
-        pass
-    return []
-
-
-def _invidious_search(query, max_results=25):
-    """Search YouTube via Invidious API (kept as last-resort fallback)."""
-    encoded = quote(query)
-    for instance in INVIDIOUS_INSTANCES:
-        url = f"{instance}/api/v1/search?q={encoded}&type=video&page=1"
-        try:
-            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            resp = urlopen(req, timeout=20)
-            data = json.loads(resp.read().decode())
-            results = []
-            for item in data[:max_results]:
-                if item.get("type") != "video":
-                    continue
-                results.append(_make_video_dict(
-                    video_id=item.get("videoId", ""),
-                    title=item.get("title", ""),
-                    uploader=item.get("author", ""),
-                    duration=item.get("lengthSeconds", 0),
-                    view_count=item.get("viewCount", 0),
-                    description=item.get("description", ""),
-                ))
-            if results:
-                print(f"      [via {instance.split('//')[1].split('/')[0]}]")
-                return results
-        except (URLError, json.JSONDecodeError, Exception):
-            continue
-    return []
-
-
-def search_youtube(query, max_results=25):
-    """Multi-engine search: Piped -> DuckDuckGo -> Invidious."""
-    # 1. Try Piped API (most reliable public YouTube proxy)
-    results = _piped_search(query, max_results)
-    if results:
-        return results
-    # 2. Try DuckDuckGo web search
-    results = _duckduckgo_search(query, max_results)
-    if results:
-        return results
-    # 3. Try Invidious API (last resort)
-    results = _invidious_search(query, max_results)
-    if results:
-        return results
-    print(f"      [all search engines failed]")
-    return []
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-OUTPUT_FILE = "firework_video_data.xlsx"
-MAX_RESULTS_PER_QUERY = 25
-FETCH_DELAY = 0.8
-
-SEARCH_QUERIES = [
-    "firework cake barrage repeater multi-shot demo test",
-    "firework fountain ground fountain consumer review",
-    "cake firework 500g 200g backyard test demo",
-    "fountain firework cone ice fountain test demo",
-    "multi-shot aerial cake firework review unboxing",
-    "barrage repeater firework cake consumer demo",
-    "consumer firework cake fountain unboxing test",
-]
-
-INCLUDE_KEYWORDS = [
-    "cake", "barrage", "repeater", "multi-shot", "multi shot",
-    "fountain", "ground fountain", "aerial cake",
-    "firework cake", "firework fountain", "500g cake", "200g cake",
-    "consumer firework", "backyard firework", "cake demo",
-    "cone fountain", "ice fountain", "compound cake",
-]
-
-EXCLUDE_KEYWORDS = [
-    "firework show", "fireworks show", "display shell",
-    "professional display", "pyromusical", "firework competition",
-    "firework festival", "music video", "how to make",
-    "tutorial", "diy firework", "manufacturing", "drone",
-    "wedding", "new year countdown", "new years eve",
-    "4th of july show", "fourth of july show",
-    "independence day show", "mall show", "stadium",
-    "orchestra", "concert",
-]
-
-# ============================================================
-# EXCEL HEADERS
-# ============================================================
-
-HEADERS = [
-    "样本编号", "视频URL", "UP主名称", "UP主类型",
-    "发布年份", "发布月份", "产品大类",
-    "发数", "筒径规格", "药量(g)", "燃放时长", "效果类型",
-    "播放量", "点击率CTR", "完播率",
-    "点赞数", "评论数", "收藏数", "综合互动率",
-]
-
-MANUAL_COLS = {4, 8, 9, 10, 11, 12}
-UNAVAILABLE_COLS = {14, 15, 18}
-
-
-# ============================================================
-# ENRICHMENT (via yt-dlp)
-# ============================================================
-
-def get_detailed_info(video_id):
-    """Fetch full video metadata via yt-dlp. Returns None on failure."""
-    time.sleep(FETCH_DELAY)
-    cmd = [
-        YTDLP,
-        f"https://www.youtube.com/watch?v={video_id}",
-        "--dump-json", "--skip-download",
-        "--no-warnings", "--ignore-errors",
-        "--socket-timeout", "20",
-        "--retries", "2",
-        "--extractor-args", "youtube:player_client=android,ios",
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0 or not result.stdout.strip():
-            return None
-        return json.loads(result.stdout)
-    except (subprocess.TimeoutExpired, json.JSONDecodeError):
-        return None
-
-
-# ============================================================
-# FILTERING & CLASSIFICATION
-# ============================================================
-
-def is_relevant(info):
-    title = (info.get("title") or "").lower()
-    description = (info.get("description") or "").lower()
-    text = f"{title} {description}"
-
-    if not any(kw.lower() in text for kw in INCLUDE_KEYWORDS):
-        return False
-    if any(kw.lower() in text for kw in EXCLUDE_KEYWORDS):
-        return False
-
-    duration = info.get("duration") or 0
-    if duration < 25 or duration > 1200:
-        return False
-
-    url = info.get("webpage_url", "")
-    if "/shorts/" in url:
-        return False
-
-    return True
-
-
-def classify_product(title, description):
-    text = f"{title or ''} {description or ''}".lower()
-    for kw in ["fountain", "ground fountain", "cone fountain", "ice fountain"]:
-        if kw in text:
-            return "fountain"
-    for kw in ["cake", "barrage", "repeater", "multi-shot", "multi shot",
-               "aerial cake", "500g cake", "200g cake", "compound cake"]:
-        if kw in text:
-            return "cake"
-    return "未知"
-
-
-def parse_date(upload_date_str):
-    if not upload_date_str or len(upload_date_str) != 8:
-        return None, None
-    try:
-        dt = datetime.strptime(upload_date_str, "%Y%m%d")
-        return str(dt.year), f"{dt.month:02d}"
-    except ValueError:
-        return None, None
-
-
-# ============================================================
-# EXCEL OUTPUT
-# ============================================================
-
-def create_excel_template(filepath):
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "烟花视频数据"
-
-    header_font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
-    header_fill = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
-    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    border = Border(
-        left=Side(style="thin"), right=Side(style="thin"),
-        top=Side(style="thin"), bottom=Side(style="thin"),
-    )
-
-    for col_idx, header in enumerate(HEADERS, 1):
-        cell = ws.cell(row=1, column=col_idx, value=header)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = header_align
-        cell.border = border
-
-    col_widths = {
-        1: 10, 2: 45, 3: 28, 4: 12, 5: 10, 6: 10,
-        7: 12, 8: 10, 9: 12, 10: 10, 11: 18, 12: 24,
-        13: 14, 14: 12, 15: 10, 16: 12, 17: 12, 18: 12, 19: 18,
-    }
-    for col, width in col_widths.items():
-        ws.column_dimensions[get_column_letter(col)].width = width
-
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(HEADERS))}1"
-
-    # Notes sheet
-    ws2 = wb.create_sheet("说明")
-    ws2.column_dimensions["A"].width = 22
-    ws2.column_dimensions["B"].width = 65
-
-    notes = [
-        ("数据采集日期", datetime.now().strftime("%Y-%m-%d %H:%M")),
-        ("数据来源", "YouTube 公开视频（通过 Invidious 镜像搜索）"),
-        ("采集方式", "Invidious API 搜索 + yt-dlp 元数据增强"),
-        ("时间范围", "2023-2026 年发布的视频"),
-        ("产品类别", "cake（组合烟花 / 连发）\nfountain（喷花 / 地面喷泉）"),
-        ("", ""),
-        ("═══ 字段说明 ═══", ""),
-        ("样本编号", "系统自动编号"),
-        ("视频URL", "YouTube 视频链接"),
-        ("UP主名称", "频道名称"),
-        ("UP主类型", "厂商 / 测评 / 个人 —— 需人工判断后填写"),
-        ("发布年份 / 月份", "从视频元数据自动提取"),
-        ("产品大类", "cake / fountain，基于标题关键词自动分类"),
-        ("发数", "⚠ 需人工观看视频后标注"),
-        ("筒径规格", "⚠ 需人工观看视频后标注"),
-        ("药量(g)", "⚠ 需人工观看视频后标注"),
-        ("燃放时长", "⚠ 需人工标注：≤10s / 10-30s / 30-60s / ＞60s"),
-        ("效果类型", "⚠ 需人工标注：爆响 / 单色 / 多色渐变 / 闪光 / 冷光 / 造型"),
-        ("播放量", "YouTube 公开数据"),
-        ("点击率CTR", "❌ 仅视频上传者可在 YouTube Studio 查看"),
-        ("完播率", "❌ 仅视频上传者可在 YouTube Studio 查看"),
-        ("点赞数", "YouTube 公开数据"),
-        ("评论数", "YouTube 公开数据"),
-        ("收藏数", "❌ YouTube 不公开收藏/保存数据"),
-        ("综合互动率", "= (点赞数 + 评论数 + 收藏数) / 播放量"),
-        ("", ""),
-        ("═══ 重要提示 ═══", ""),
-        ("数据局限性", "CTR、完播率、收藏数均不可公开获取。热度数据为采集时刻的快照。"),
-        ("标注工作量", "发数/筒径/药量/燃放时长/效果类型需逐一观看视频后人工标注。"),
-        ("代表性声明", "数据仅代表 YouTube 线上关注度偏好，不等同于实际购买行为。"),
-    ]
-
-    for row_idx, (label, value) in enumerate(notes, 1):
-        ws2.cell(row=row_idx, column=1, value=label).font = Font(name="Arial", size=10, bold=True)
-        ws2.cell(row=row_idx, column=2, value=value).font = Font(name="Arial", size=10)
-
-    wb.save(filepath)
-    print(f"  Excel template created: {filepath}")
-
-
-def append_data(filepath, rows):
-    wb = openpyxl.load_workbook(filepath)
-    ws = wb["烟花视频数据"]
-    start_row = ws.max_row + 1
-
-    data_font = Font(name="Arial", size=10)
-    data_align = Alignment(vertical="center")
-    url_font = Font(name="Arial", size=10, color="0563C1", underline="single")
-    border = Border(
-        left=Side(style="thin"), right=Side(style="thin"),
-        top=Side(style="thin"), bottom=Side(style="thin"),
-    )
-    manual_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-    unavailable_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
-
-    for row_idx, row_data in enumerate(rows, start_row):
-        for col_idx, value in enumerate(row_data, 1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=value)
-            cell.font = url_font if col_idx == 2 else data_font
-            cell.alignment = data_align
-            cell.border = border
-            if col_idx in MANUAL_COLS:
-                cell.fill = manual_fill
-            elif col_idx in UNAVAILABLE_COLS:
-                cell.fill = unavailable_fill
-
-    wb.save(filepath)
-    print(f"  {len(rows)} data rows appended (starting row {start_row})")
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def collect_data(output_file):
-    print("=" * 60)
-    print("  YouTube Firework Video Data Collector")
-    print("  cake & fountain | 2023-2026")
-    print("  Search: Invidious API | Enrich: yt-dlp")
-    print("=" * 60)
-
-    if not Path(output_file).exists():
-        create_excel_template(output_file)
-    else:
-        print(f"  Using existing template: {output_file}")
-
-    # Phase 1: Search (Piped -> DuckDuckGo -> Invidious)
-    print("\n[Phase 1] Searching YouTube (multi-engine)...")
-    all_videos = {}
-
-    for query in SEARCH_QUERIES:
-        print(f"  Query: '{query[:60]}...'")
-        results = search_youtube(query, max_results=MAX_RESULTS_PER_QUERY)
-        print(f"    -> {len(results)} results")
-        for info in results:
-            vid = info.get("id")
-            if vid and vid not in all_videos:
-                all_videos[vid] = info
-
-    print(f"\n  Unique videos (before filtering): {len(all_videos)}")
-
-    # Phase 2: Filter
-    print("\n[Phase 2] Filtering...")
-    filtered = {vid: info for vid, info in all_videos.items() if is_relevant(info)}
-    print(f"  After filtering: {len(filtered)} videos")
-
-    # Phase 3: Enrich
-    print("\n[Phase 3] Enriching via yt-dlp (views, likes, dates)...")
-    print(f"  (Delay: {FETCH_DELAY}s per video)\n")
-
-    rows = []
-    sample_id = 0
-    skipped_year = 0
-    fetch_fail = 0
-
-    for idx, (video_id, info) in enumerate(filtered.items()):
-        title_short = (info.get("title") or "N/A")[:55]
-        print(f"  [{idx+1}/{len(filtered)}] {title_short}...", end=" ", flush=True)
-
-        detailed = get_detailed_info(video_id)
-        if detailed:
-            info = detailed
-        else:
-            fetch_fail += 1
-            if not info.get("duration"):
-                print("(skipped)")
-                continue
-            print("(Invidious data)", end=" ")
-
-        upload_date_str = info.get("upload_date")
-        if not upload_date_str:
-            print("(skipped - no date)")
-            continue
-
-        year, month = parse_date(upload_date_str)
-        if year is None:
-            print("(skipped - bad date)")
-            continue
-        if int(year) < 2023 or int(year) > 2026:
-            skipped_year += 1
-            print(f"(skipped - year={year})")
-            continue
-
-        title = info.get("title") or "N/A"
-        description = info.get("description") or ""
-        channel = info.get("uploader") or info.get("channel") or "N/A"
-        view_count = info.get("view_count") or 0
-        like_count = info.get("like_count") or 0
-        comment_count = info.get("comment_count") or 0
-        product_type = classify_product(title, description)
-        engagement = round((like_count + comment_count) / view_count, 8) if view_count > 0 else 0
-
-        sample_id += 1
-        rows.append([
-            sample_id,
-            f"https://www.youtube.com/watch?v={video_id}",
-            channel,
-            "",
-            year,
-            month,
-            product_type,
-            "", "", "", "", "",
-            view_count,
-            "", "",
-            like_count,
-            comment_count,
-            "",
-            engagement,
-        ])
-        print("ok")
-
-    # Phase 4: Write Excel
-    print(f"\n[Phase 4] Writing Excel...")
-    print(f"  Valid samples: {sample_id}")
-    print(f"  Skipped (year): {skipped_year}")
-    print(f"  Skipped (fetch): {fetch_fail}")
-
-    if rows:
-        append_data(output_file, rows)
-    else:
-        print("  No data rows. All Invidious instances may be down.")
-
-    cakes = sum(1 for r in rows if r[6] == "cake")
-    fountains = sum(1 for r in rows if r[6] == "fountain")
-
-    print("\n" + "=" * 60)
-    print(f"  DONE - {len(rows)} samples")
-    print(f"    Cake: {cakes}  Fountain: {fountains}")
-    print(f"    Output: {output_file}")
-    print("=" * 60)
-
-
-if __name__ == "__main__":
-    output_path = str(Path(__file__).parent / OUTPUT_FILE)
-    collect_data(output_path)
+  #!/usr/bin/env python3
+  import os, json, sys, time, re
+  from datetime import datetime
+  from pathlib import Path
+  from urllib.request import Request, urlopen
+  from urllib.error import URLError
+  from urllib.parse import urlencode
+  import openpyxl
+  from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+  from openpyxl.utils import get_column_letter
+
+  OUTPUT_FILE = "firework_video_data.xlsx"
+  MAX_RESULTS_PER_QUERY = 25
+  API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+
+  SEARCH_QUERIES = [
+      "firework cake barrage repeater multi-shot demo test",
+      "firework fountain ground fountain consumer review",
+      "cake firework 500g 200g backyard test demo",
+      "fountain firework cone ice fountain test demo",
+      "multi-shot aerial cake firework review unboxing",
+      "barrage repeater firework cake consumer demo",
+      "consumer firework cake fountain unboxing test",
+  ]
+
+  INCLUDE_KEYWORDS = [
+      "cake", "barrage", "repeater", "multi-shot", "multi shot",
+      "fountain", "ground fountain", "aerial cake",
+      "firework cake", "firework fountain", "500g cake", "200g cake",
+      "consumer firework", "backyard firework", "cake demo",
+      "cone fountain", "ice fountain", "compound cake",
+  ]
+
+  EXCLUDE_KEYWORDS = [
+      "firework show", "fireworks show", "display shell",
+      "professional display", "pyromusical", "firework competition",
+      "firework festival", "music video", "how to make",
+      "tutorial", "diy firework", "manufacturing", "drone",
+      "wedding", "new year countdown", "new years eve",
+      "4th of july show", "fourth of july show",
+      "independence day show", "mall show", "stadium",
+      "orchestra", "concert",
+  ]
+
+  HEADERS = [
+      "样本编号", "视频URL", "UP主名称", "UP主类型",
+      "发布年份", "发布月份", "产品大类",
+      "发数", "筒径规格", "药量(g)", "燃放时长", "效果类型",
+      "播放量", "点击率CTR", "完播率",
+      "点赞数", "评论数", "收藏数", "综合互动率",
+  ]
+
+  MANUAL_COLS = {4, 8, 9, 10, 11, 12}
+  UNAVAILABLE_COLS = {14, 15, 18}
+
+
+  def _api_call(endpoint, params):
+      params["key"] = API_KEY
+      url = f"https://www.googleapis.com/youtube/v3/{endpoint}?{urlencode(params)}"
+      try:
+          req = Request(url, headers={"User-Agent": "FireworkCollector/1.0"})
+          resp = urlopen(req, timeout=30)
+          return json.loads(resp.read().decode())
+      except URLError as e:
+          print(f"    API error: {e}")
+          return None
+
+
+  def search_youtube_api(query, max_results=25):
+      results = []
+      page_token = None
+      while len(results) < max_results:
+          params = {
+              "part": "snippet", "q": query, "type": "video",
+              "maxResults": min(50, max_results - len(results)),
+              "relevanceLanguage": "en", "regionCode": "US",
+          }
+          if page_token:
+              params["pageToken"] = page_token
+          data = _api_call("search", params)
+          if not data or "items" not in data:
+              break
+          for item in data["items"]:
+              vid = item["id"].get("videoId")
+              if not vid:
+                  continue
+              s = item.get("snippet", {})
+              results.append({
+                  "id": vid,
+                  "title": s.get("title", ""),
+                  "description": s.get("description", ""),
+                  "uploader": s.get("channelTitle", ""),
+                  "published_at": s.get("publishedAt", ""),
+                  "webpage_url": f"https://www.youtube.com/watch?v={vid}",
+              })
+          page_token = data.get("nextPageToken")
+          if not page_token:
+              break
+      return results[:max_results]
+
+
+  def get_batch_details(video_ids):
+      params = {
+          "part": "statistics,contentDetails,snippet",
+          "id": ",".join(video_ids), "maxResults": "50",
+      }
+      data = _api_call("videos", params)
+      if not data or "items" not in data:
+          return {}
+      details = {}
+      for item in data["items"]:
+          vid = item["id"]
+          s = item.get("snippet", {})
+          st = item.get("statistics", {})
+          c = item.get("contentDetails", {})
+          details[vid] = {
+              "title": s.get("title", ""),
+              "description": s.get("description", ""),
+              "uploader": s.get("channelTitle", ""),
+              "published_at": s.get("publishedAt", ""),
+              "view_count": int(st.get("viewCount", 0)),
+              "like_count": int(st.get("likeCount", 0)),
+              "comment_count": int(st.get("commentCount", 0)),
+              "duration_iso": c.get("duration", ""),
+          }
+      return details
+
+
+  def parse_iso_duration(iso_dur):
+      m = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', iso_dur)
+      if not m:
+          return 0
+      h, mn, s = m.groups()
+      return int(h or 0) * 3600 + int(mn or 0) * 60 + int(s or 0)
+
+
+  def is_relevant(info):
+      title = (info.get("title") or "").lower()
+      desc = (info.get("description") or "").lower()
+      text = f"{title} {desc}"
+      if not any(kw.lower() in text for kw in INCLUDE_KEYWORDS):
+          return False
+      if any(kw.lower() in text for kw in EXCLUDE_KEYWORDS):
+          return False
+      dur = info.get("duration_seconds") or 0
+      if dur and (dur < 25 or dur > 1200):
+          return False
+      if "/shorts/" in info.get("webpage_url", ""):
+          return False
+      return True
+
+
+  def classify_product(title, desc):
+      text = f"{title or ''} {desc or ''}".lower()
+      for kw in ["fountain", "ground fountain", "cone fountain", "ice fountain"]:
+          if kw in text:
+              return "fountain"
+      for kw in ["cake", "barrage", "repeater", "multi-shot", "multi shot",
+                 "aerial cake", "500g cake", "200g cake", "compound cake"]:
+          if kw in text:
+              return "cake"
+      return "未知"
+
+
+  def parse_published(published_at):
+      if not published_at:
+          return None, None
+      try:
+          dt = datetime.strptime(published_at[:19], "%Y-%m-%dT%H:%M:%S")
+          return str(dt.year), f"{dt.month:02d}"
+      except ValueError:
+          return None, None
+
+
+  def create_excel_template(filepath):
+      wb = openpyxl.Workbook()
+      ws = wb.active
+      ws.title = "烟花视频数据"
+      hf = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+      hfill = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
+      ha = Alignment(horizontal="center", vertical="center", wrap_text=True)
+      b = Border(left=Side(style="thin"), right=Side(style="thin"),
+                 top=Side(style="thin"), bottom=Side(style="thin"))
+      for i, h in enumerate(HEADERS, 1):
+          c = ws.cell(row=1, column=i, value=h)
+          c.font, c.fill, c.alignment, c.border = hf, hfill, ha, b
+      for col, w in {1:10, 2:45, 3:28, 4:12, 5:10, 6:10, 7:12, 8:10, 9:12,
+                     10:10, 11:18, 12:24, 13:14, 14:12, 15:10, 16:12, 17:12,
+                     18:12, 19:18}.items():
+          ws.column_dimensions[get_column_letter(col)].width = w
+      ws.freeze_panes = "A2"
+      ws.auto_filter.ref = f"A1:{get_column_letter(len(HEADERS))}1"
+      wb.save(filepath)
+      print(f"  Excel template created: {filepath}")
+
+
+  def append_data(filepath, rows):
+      wb = openpyxl.load_workbook(filepath)
+      ws = wb["烟花视频数据"]
+      sr = ws.max_row + 1
+      df = Font(name="Arial", size=10)
+      da = Alignment(vertical="center")
+      uf = Font(name="Arial", size=10, color="0563C1", underline="single")
+      b = Border(left=Side(style="thin"), right=Side(style="thin"),
+                 top=Side(style="thin"), bottom=Side(style="thin"))
+      mf = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+      uaf = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+      for ri, rd in enumerate(rows, sr):
+          for ci, v in enumerate(rd, 1):
+              c = ws.cell(row=ri, column=ci, value=v)
+              c.font = uf if ci == 2 else df
+              c.alignment, c.border = da, b
+              if ci in MANUAL_COLS:
+                  c.fill = mf
+              elif ci in UNAVAILABLE_COLS:
+                  c.fill = uaf
+      wb.save(filepath)
+      print(f"  {len(rows)} data rows appended (starting row {sr})")
+
+
+  def collect_data(output_file):
+      if not API_KEY:
+          print("ERROR: YOUTUBE_API_KEY not set!")
+          sys.exit(1)
+      print("=" * 60)
+      print("  YouTube Firework Data Collector | API v3")
+      print("  cake & fountain | 2023-2026")
+      print("=" * 60)
+      create_excel_template(output_file)
+      print("\n[Phase 1] Searching via YouTube Data API v3...")
+      all_videos = {}
+      total_quota = 0
+      for query in SEARCH_QUERIES:
+          print(f"  Query: '{query[:60]}...'")
+          results = search_youtube_api(query, max_results=MAX_RESULTS_PER_QUERY)
+          total_quota += 100
+          print(f"    -> {len(results)} results")
+          for info in results:
+              vid = info.get("id")
+              if vid and vid not in all_videos:
+                  all_videos[vid] = info
+      print(f"\n  Unique videos: {len(all_videos)}")
+      print(f"  Quota used: {total_quota}/10000")
+      print("\n[Phase 2] Filtering...")
+      filtered = {vid: info for vid, info in all_videos.items() if is_relevant(info)}
+      print(f"  After filtering: {len(filtered)} videos")
+      print("\n[Phase 3] Fetching statistics (batch)...")
+      rows = []
+      sample_id = 0
+      video_ids = list(filtered.keys())
+      for i in range(0, len(video_ids), 50):
+          batch = video_ids[i:i+50]
+          details = get_batch_details(batch)
+          total_quota += 1
+          for vid in batch:
+              info = filtered[vid]
+              detail = details.get(vid, {})
+              if detail:
+                  info.update(detail)
+              iso = info.get("duration_iso", "")
+              info["duration_seconds"] = parse_iso_duration(iso) if iso else 0
+              if not is_relevant(info):
+                  continue
+              year, month = parse_published(info.get("published_at", ""))
+              if year is None:
+                  continue
+              if int(year) < 2023 or int(year) > 2026:
+                  continue
+              title = info.get("title") or "N/A"
+              desc = info.get("description") or ""
+              ch = info.get("uploader") or "N/A"
+              vc = info.get("view_count") or 0
+              lc = info.get("like_count") or 0
+              cc = info.get("comment_count") or 0
+              pt = classify_product(title, desc)
+              eng = round((lc + cc) / vc, 8) if vc > 0 else 0
+              sample_id += 1
+              rows.append([sample_id, f"https://www.youtube.com/watch?v={vid}",
+                           ch, "", year, month, pt,
+                           "", "", "", "", "",
+                           vc, "", "", lc, cc, "", eng])
+      print(f"  Quota used: {total_quota}/10000")
+      print(f"\n[Phase 4] Writing Excel: {len(rows)} samples")
+      if rows:
+          append_data(output_file, rows)
+      else:
+          print("  No data rows.")
+      cakes = sum(1 for r in rows if r[6] == "cake")
+      fountains = sum(1 for r in rows if r[6] == "fountain")
+      print(f"\n  DONE - {len(rows)} samples (Cake: {cakes} Fountain: {fountains})")
+
+  if __name__ == "__main__":
+      collect_data(str(Path(__file__).parent / OUTPUT_FILE))
