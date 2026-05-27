@@ -12,7 +12,7 @@ on:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     steps:
       - name: 检出代码
@@ -24,21 +24,11 @@ jobs:
           python-version: '3.12'
 
       - name: 安装依赖
-        run: pip install openpyxl yt-dlp
-
-      - name: 连通性诊断
-        run: |
-          echo "=== yt-dlp version ==="
-          yt-dlp --version
-          echo ""
-          echo "=== Quick YouTube search test ==="
-          yt-dlp --no-warnings --ignore-errors --socket-timeout 20 \
-            --dump-json --skip-download \
-            "ytsearch3:firework cake demo" 2>&1 | head -50
-          echo ""
-          echo "=== Diagnostic done ==="
+        run: pip install openpyxl
 
       - name: 采集数据
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
         run: |
           if [ "${{ github.event.inputs.results_per_query }}" != "25" ]; then
             sed -i "s/MAX_RESULTS_PER_QUERY = 25/MAX_RESULTS_PER_QUERY = ${{ github.event.inputs.results_per_query }}/" collect_data.py
