@@ -159,7 +159,7 @@ def search_youtube(query, max_results=MAX_RESULTS_PER_QUERY):
         "--skip-download",
         "--no-warnings",
         "--ignore-errors",
-        "--socket-timeout", "30",
+        "--socket-timeout", "30","--extractor-args", "youtube:player_client=android,ios",
     ]
     if PROXY:
         cmd.extend(["--proxy", PROXY])
@@ -194,7 +194,7 @@ def get_detailed_info(video_id):
         "--skip-download",
         "--no-warnings",
         "--ignore-errors",
-        "--socket-timeout", "30",
+        "--socket-timeout", "30","--extractor-args", "youtube:player_client=android,ios",
     ]
     if PROXY:
         cmd.extend(["--proxy", PROXY])
