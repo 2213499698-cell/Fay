@@ -57,23 +57,103 @@ YTDLP = _find_ytdlp()
 
 
 # ============================================================
-# INVIDIOUS INSTANCES (public YouTube mirrors)
+# SEARCH: Piped API -> DuckDuckGo -> Invidious (multi-fallback)
 # ============================================================
+
+PIPED_INSTANCES = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.tokhmi.xyz",
+    "https://pipedapi.moomoo.me",
+    "https://pipedapi.syncpundit.io",
+    "https://pipedapi.adminforge.de",
+    "https://pipedapi.leptons.xyz",
+]
 
 INVIDIOUS_INSTANCES = [
     "https://invidious.fdn.fr",
     "https://vid.puffyan.us",
-    "https://invidious.perennialte.ch",
     "https://yewtu.be",
     "https://inv.nadeko.net",
-    "https://invidious.privacyredirect.com",
-    "https://invidious.nerdvpn.de",
-    "https://invidious.slipfox.xyz",
 ]
 
 
+def _make_video_dict(video_id, title="", uploader="", duration=0, view_count=0, description=""):
+    return {
+        "id": video_id,
+        "title": title,
+        "description": description,
+        "uploader": uploader,
+        "duration": duration,
+        "view_count": view_count,
+        "upload_date": None,
+        "webpage_url": f"https://www.youtube.com/watch?v={video_id}",
+    }
+
+
+def _piped_search(query, max_results=25):
+    """Search YouTube via Piped API."""
+    encoded = quote(query)
+    for instance in PIPED_INSTANCES:
+        url = f"{instance}/search?q={encoded}&filter=videos"
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            resp = urlopen(req, timeout=20)
+            data = json.loads(resp.read().decode())
+            results = []
+            for item in data.get("items", [])[:max_results]:
+                vid_url = item.get("url", "")
+                vid = vid_url.replace("/watch?v=", "") if "/watch?v=" in vid_url else ""
+                if not vid:
+                    continue
+                # Piped duration is in seconds, views as integer
+                results.append(_make_video_dict(
+                    video_id=vid,
+                    title=item.get("title", ""),
+                    uploader=item.get("uploaderName", ""),
+                    duration=item.get("duration", 0),
+                    view_count=item.get("views", 0),
+                    description=item.get("shortDescription", ""),
+                ))
+            if results:
+                print(f"      [via {instance.split('//')[1].split('/')[0]}]")
+                return results
+        except (URLError, json.JSONDecodeError, Exception):
+            continue
+    return []
+
+
+def _duckduckgo_search(query, max_results=25):
+    """Search for YouTube videos via DuckDuckGo HTML (no auth needed)."""
+    import re
+    encoded = quote(f"site:youtube.com/watch {query}")
+    url = f"https://html.duckduckgo.com/html/?q={encoded}"
+    try:
+        req = Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        resp = urlopen(req, timeout=20)
+        html = resp.read().decode("utf-8", errors="replace")
+        # Extract YouTube video IDs from result links
+        ids = re.findall(r'youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})', html)
+        seen = set()
+        results = []
+        for vid in ids:
+            if vid in seen:
+                continue
+            seen.add(vid)
+            results.append(_make_video_dict(video_id=vid))
+            if len(results) >= max_results:
+                break
+        if results:
+            print(f"      [via DuckDuckGo]")
+            return results
+    except (URLError, Exception):
+        pass
+    return []
+
+
 def _invidious_search(query, max_results=25):
-    """Search YouTube via Invidious API. Returns list of video dicts."""
+    """Search YouTube via Invidious API (kept as last-resort fallback)."""
     encoded = quote(query)
     for instance in INVIDIOUS_INSTANCES:
         url = f"{instance}/api/v1/search?q={encoded}&type=video&page=1"
@@ -85,21 +165,37 @@ def _invidious_search(query, max_results=25):
             for item in data[:max_results]:
                 if item.get("type") != "video":
                     continue
-                results.append({
-                    "id": item.get("videoId"),
-                    "title": item.get("title", ""),
-                    "description": item.get("description", ""),
-                    "uploader": item.get("author", ""),
-                    "uploader_id": item.get("authorId", ""),
-                    "duration": item.get("lengthSeconds", 0),
-                    "view_count": item.get("viewCount", 0),
-                    "upload_date": None,
-                    "webpage_url": f"https://www.youtube.com/watch?v={item.get('videoId')}",
-                })
+                results.append(_make_video_dict(
+                    video_id=item.get("videoId", ""),
+                    title=item.get("title", ""),
+                    uploader=item.get("author", ""),
+                    duration=item.get("lengthSeconds", 0),
+                    view_count=item.get("viewCount", 0),
+                    description=item.get("description", ""),
+                ))
             if results:
+                print(f"      [via {instance.split('//')[1].split('/')[0]}]")
                 return results
         except (URLError, json.JSONDecodeError, Exception):
             continue
+    return []
+
+
+def search_youtube(query, max_results=25):
+    """Multi-engine search: Piped -> DuckDuckGo -> Invidious."""
+    # 1. Try Piped API (most reliable public YouTube proxy)
+    results = _piped_search(query, max_results)
+    if results:
+        return results
+    # 2. Try DuckDuckGo web search
+    results = _duckduckgo_search(query, max_results)
+    if results:
+        return results
+    # 3. Try Invidious API (last resort)
+    results = _invidious_search(query, max_results)
+    if results:
+        return results
+    print(f"      [all search engines failed]")
     return []
 
 
@@ -355,13 +451,13 @@ def collect_data(output_file):
     else:
         print(f"  Using existing template: {output_file}")
 
-    # Phase 1: Search via Invidious
-    print("\n[Phase 1] Searching via Invidious API...")
+    # Phase 1: Search (Piped -> DuckDuckGo -> Invidious)
+    print("\n[Phase 1] Searching YouTube (multi-engine)...")
     all_videos = {}
 
     for query in SEARCH_QUERIES:
         print(f"  Query: '{query[:60]}...'")
-        results = _invidious_search(query, max_results=MAX_RESULTS_PER_QUERY)
+        results = search_youtube(query, max_results=MAX_RESULTS_PER_QUERY)
         print(f"    -> {len(results)} results")
         for info in results:
             vid = info.get("id")
