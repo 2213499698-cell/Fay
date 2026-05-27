@@ -26,15 +26,27 @@ jobs:
       - name: 安装依赖
         run: pip install openpyxl yt-dlp
 
+      - name: 连通性诊断
+        run: |
+          echo "=== yt-dlp version ==="
+          yt-dlp --version
+          echo ""
+          echo "=== Quick YouTube search test ==="
+          yt-dlp --no-warnings --ignore-errors --socket-timeout 20 \
+            --dump-json --skip-download \
+            "ytsearch3:firework cake demo" 2>&1 | head -50
+          echo ""
+          echo "=== Diagnostic done ==="
+
       - name: 采集数据
         run: |
-          # Override max results if user specified
           if [ "${{ github.event.inputs.results_per_query }}" != "25" ]; then
             sed -i "s/MAX_RESULTS_PER_QUERY = 25/MAX_RESULTS_PER_QUERY = ${{ github.event.inputs.results_per_query }}/" collect_data.py
           fi
           python collect_data.py
 
       - name: 上传Excel结果
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: firework_video_data

@@ -160,13 +160,22 @@ def search_youtube(query, max_results=MAX_RESULTS_PER_QUERY):
         "--no-warnings",
         "--ignore-errors",
         "--socket-timeout", "30",
+        "--retries", "3",
+        "--extractor-retries", "3",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     ]
     if PROXY:
         cmd.extend(["--proxy", PROXY])
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        # Print stderr for debugging (yt-dlp writes warnings here even with --no-warnings)
+        stderr = result.stderr.strip()
+        if stderr:
+            # Only show first 500 chars to avoid log flooding
+            print(f"    [yt-dlp stderr] {stderr[:500]}")
+
         if result.returncode != 0 and not result.stdout.strip():
-            print(f"    Warning: search failed: {result.stderr[:150]}")
+            print(f"    Warning: search failed with code {result.returncode}")
             return videos
 
         for line in result.stdout.strip().split("\n"):
@@ -195,6 +204,9 @@ def get_detailed_info(video_id):
         "--no-warnings",
         "--ignore-errors",
         "--socket-timeout", "30",
+        "--retries", "3",
+        "--extractor-retries", "3",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     ]
     if PROXY:
         cmd.extend(["--proxy", PROXY])
@@ -401,6 +413,12 @@ def collect_data(output_file):
     print("  cake (组合烟花) & fountain (喷花) | 2023–2026")
     print("=" * 60)
 
+    # ---- Phase 0: Create template first (so file exists even on failure) ----
+    if not Path(output_file).exists():
+        create_excel_template(output_file)
+    else:
+        print(f"  Using existing template: {output_file}")
+
     # ---- Phase 1: Search ----
     print("\n[Phase 1] Searching YouTube...")
     all_videos = {}
@@ -491,13 +509,10 @@ def collect_data(output_file):
     print(f"  Skipped (year out of range): {skipped_year}")
     print(f"  Skipped (fetch failed): {fetch_fail}")
 
-    if not Path(output_file).exists():
-        create_excel_template(output_file)
-    else:
-        print(f"  Using existing template: {output_file}")
-
     if rows:
         append_data(output_file, rows)
+    else:
+        print(f"  No data rows to append — the template is ready for manual entry.")
 
     # ---- Summary ----
     cakes = sum(1 for r in rows if r[6] == "cake")
